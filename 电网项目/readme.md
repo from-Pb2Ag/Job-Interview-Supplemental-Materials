@@ -22,7 +22,7 @@ Q: 电网需要「拓扑信息」是比较显然的, 为什么还需要「地理
 >A: 学术界能用的典型电网 (不带地理信息的) 是这样的 (ieee 9 bus测试案例), 在节点与传输线构成的无向图之外, 还附带一系列电气参数:
 ![](./images/ieee9bus_1.bmp)
 ![](./images/ieee9bus_2.bmp)
-再比如少数像ieee 39 bus测试案例这样的, 描述了对应的地理位置区域 (新英格兰地区), 但只有非常少的测试样例像这样给出了每个节点的**地理位置**, 而且ieee的测试样例绝大多数规模小 (节点数 $n<200$) 且无关地理信息.
+再比如少数像ieee 39 bus测试案例这样的, 描述了**对应的地理位置区域** (新英格兰地区), 但只有非常少的测试样例像这样给出了每个节点的**地理位置**, 而且ieee的测试样例绝大多数规模小 (节点数 $n<200$) 且无关地理信息.
 ![](./images/ieee39bus_1.bmp)
 ![](./images/ieee39bus_2.bmp)
 
@@ -186,9 +186,9 @@ func (t *TowerConfig) ComputeInductance(tl *TransmissionLine) float64 {
 }
 ```
 $$D_{eq}=\sqrt[3]{D_{12}D_{23}D_{13}}$$
-$$D_{SL}=\sqrt[3]{D_{s}\times d^{2}}, \text{对三集束而言}$$
+$$D_{SL}=\sqrt[3]{D_{s}\times d^{2}}$$
 $$L_{a}=2\times10^{-7}\ln{\frac{D_{eq}}{D_{SL}}} \text{H/m}$$
-> 其中$D_{s}$是ACSR的**等效半径** (近似为物理半径的$e^{-1/4}\approx0.78$倍, 这又是个复杂的电磁学计算), 由handbook给出. $d$是集束配置中中心点间距, 如下图.
+> ($D_{SL}$对三集束而言) 其中$D_{s}$是ACSR的**等效半径** (近似为物理半径的$e^{-1/4}\approx0.78$倍, 这又是个复杂的电磁学计算), 由handbook给出. $d$是集束配置中中心点间距, 如下图.
 ![](./images/bundle1.png)
 $D_{SL}$是相与相之间距离的几何平均, 如下图 (**所以说输电塔的配置需要某个距离**). 这里$L_{a}$就是计算出单位串联电感. 结合长度和角频率最后得出`x`参数.
 ![](./images/phase1.png)
@@ -257,3 +257,58 @@ Q: 最终电网的数据结构是什么样的? 怎么存储的?
 
 > client验证成功后会向主server进行post请求. 主要信息包括电网序列化后的sha256摘要. server处理post请求时, 会在mysql数据库中用sha256为主键查询对应的电网条目 (主要信息包括摘要码, 地理区域, 规模, 文件路径, 是否可计算) 元数据, 更新之.
 对于能计算的电网就能交付上游任务了.
+
+Q: server端是怎么运行的?
+> A: server端进程启动后, 笔者设计了一个简要的命令行界面. 主要就是<命令字符串, 函数指针>的哈希表. **这里借鉴了redis的一些设计**, 处理可变参数的情况.
+```Golang
+type CommandHandler struct {
+	HandlerFunc func(args []interface{})
+	ArgCount    int
+}
+
+var CommandMap = map[string]CommandHandler{
+	"hello":      {HandlerFunc: handleHello, ArgCount: 0},
+	"exit":       {HandlerFunc: handleExit, ArgCount: 0},
+	"clear":      {HandlerFunc: handleClearScreen, ArgCount: 0},
+	"echo":       {HandlerFunc: handleEchoArgs, ArgCount: -1},
+	"producenew": {HandlerFunc: handleProduceNew, ArgCount: -2}, // state id, repeat cnt is required.
+}
+```
+
+```Golang
+// 当server成功listen.
+<-server_started
+reader := bufio.NewReader(os.Stdin)
+
+for {
+	// 尝试读取缓冲区直到键入`\n`. 如果长期不键入`\n`, scheduler会调度其他go-routine运行.
+	fmt.Print("[server] Enter command: ")
+	text, _ := reader.ReadString('\n')
+	// command := strings.TrimSpace(text)
+	text = strings.TrimSpace(text)
+	argv := utils.Sdssplitargs(text)
+	if len(argv) < 1 {
+		continue
+	}
+
+	if handler, exists := CommandMap[strings.ToLower(argv[0])]; exists {
+		if handler.ArgCount >= 0 && len(argv)-1 != handler.ArgCount {
+			fmt.Printf("wrong args number for command `%s`. expect %v, get %v.\n", argv[0], handler.ArgCount, len(argv)-1)
+		} else if handler.ArgCount < 0 && len(argv) < -handler.ArgCount {
+			fmt.Printf("wrong args number for command `%s`. expect at least %v, get %v.\n", argv[0], -handler.ArgCount-1, len(argv)-1)
+		} else {
+			var args []interface{}
+			for _, v := range argv[1:] {
+				args = append(args, v)
+			}
+			handler.HandlerFunc(args)
+		}
+	} else {
+		fmt.Println("Unknown command")
+	}
+}
+```
+
+Q: 消息队列组件这么多, 为什么用kafka, 怎么考虑的?
+> A: 这个系统中, server和client关心的是消息的"验证", 置于消息被消费的顺序性, 恰好一次性都不重要; 甚至个别消息的丢失也无关紧要: 毕竟server可以 (以较慢的速度) **生成几乎永远不会重复的消息**, 丢了就再生产两个.
+这个系统真正重要的, **是生产侧的伸缩性**. topic的数目存在一个比较能遇见的上限, 美国的州级行政区也就 $51$个, 部分州关联密切还能整体考虑, 因此topic的数目不会很大, 而且如果预设一个上界后无需在这方面扩展. 但是**想喂满一个client**, 需要运行好几个server (实际部署中不经压力测试, 也就10个server). 因此从订阅-发布的扩展性角度考虑, kafka是最合适的.
