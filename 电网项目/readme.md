@@ -131,3 +131,129 @@ Q: 这么一大坨性质, 你打算怎么着手开始连边?
 ![](./images/部分候选边集.png)
 我们从三角剖分边集中选边, 有一个好处: 原本完全图的$n*(n/2)$边数空间, 现在下降到$3*n$, 即初始的delaunay三角剖分给出 $3*n$ 的边数目, 而通常电网的$n\in[100, 10000]$. 考虑到拓展为三阶临近关系, 边数也不会超过 $27*n$.
 **因此笔者的算法宏观来说, 设定总的边数 ($1.21n$), 给定每一类边配额 (MST边, 一/二/三阶临近边), 不断地擦除, 添加, 直到收敛到上述条件**.
+
+Q: 你是怎么具体地"擦除"边, "添加"边的?
+> A: 首先我们用prim算法 (优先级队列优化)生成完全图的最小生成树, 同时delaunay三角剖分得出一/二/三阶临近关系的边集.
+每轮迭代我们首先 (单线程) 统计下列信息:
+- 每个节点的度数
+- 并查集计算当前联通分量数, 每个联通分量内的点集.
+- **与其他边在非节点处相交**, 这样的边的数目 (比例). 依然是边数的二重循环, **判断是否交**是一个线性代数问题.
+
+> 有大量的边目前没选中. 我们考虑哪些边的加入, 会让本轮更趋近最终收敛状态. 考虑的要素包括:
+- 沟通不同的联通分量, 这样的边是"好边".
+- 更短的边, 这样的边是"好边".
+- 边的加入如果让两端任意一点度数上升**导致该类度数的点占比超过阈值**, 这样的边是"坏边".
+> 对每个边进行这样的打分 (对应项为"好"给一个负的penalty, 对应项为"坏"给一个正的penalty, 最终按penalty**从小到大排序**.). 每一个边最终的打分笔者使用了一个$(0.95, 1.05)$的均匀分布随机数scale了一下 (实测这样收敛更稳定些).
+
+> 由于笔者的算法中每类边都有一个配额, 需要决定每类边中哪些边被剔除, 对应类的边打分优先的换入. 在计算哪些边需要被换出时, 每个边对应的点还需要计算"团系数", 以抑制边过度聚集的情况, 它依然作为penalty的一项. 上述打分的过程可以开不同的go-routine完成, 这里笔者固定为$10$个, 使用wait group简单控制.
+> 最终收敛生成的符合拓扑要求的电网拓扑图示例如下: 实际结果表明, 对于节点在 $n<500$时, 迭代基本上能在$50$轮内收敛, 耗时$8s$以内; 对于节点数接近$n\approx1000$的情况, 比较好的情况在$300$轮内收敛, 耗时近$30s$且没有很强的保证.
+![](./images/最终生成拓扑样例.png)
+
+Q: 拓扑性质只是电网的一类性质. 其他的图也有拓扑, 电网独有的一些电气性质你怎么考虑的?
+> A: 首先上文提到了PQ节点的人口, PV节点的装机量. 笔者follow之前的文章, **每个人口对应2KW+0.57KVAR的有功/无功功率需求**. 如果要改变功率因子的话, 对应改变无功功率值. 同时装机量一般来说是大于人口需求的 (但是电厂几乎不可能在短时间内将功率爬高到装机量, 于是我们将每个发电厂的最大发电量, scale到总用电需求的$1.3$倍, 装机量是总用电需求的$2$倍以上).
+![](./images/captia.png)
+除用电需求外, 节点的重要电气属性包括运行时的电压相量 (phaser), 一般地用 **电压幅度 (`Vm`) 和较参考节点的相位 (`Va`, 角度制)** 描述, 其中`Vm`通常采用标幺值. 如节点的标准电压为$138KV$, 标幺值会记为$1$, 电压上界$1.1$则代表$1.1*138KV$. 节点会有运行时的允许电压的上下界 (**同样标幺值表示**), 其他次要的电气参数暂时不表 (因为计算模型中存在但可以忽略).
+
+> 联通节点的传输线, 存在其他的电气参数: 主要是串联的电阻电抗 (`r`, `x`. 它们可以看成复数的实部和虚部). 这方面简要的内容可以查看[slide, 37页的上下文](./slices/Section%204%20Transmission%20Lines.pdf).
+![](./images/slide_37.png)
+即需要计算上图描述的的`z`, 涉及求解常微分方程. **这里的事实是: 长度为`1km`的传输线如果复阻抗为$x$, 那同配置长度为`2km`的传输线不是`2x`, 变化是非线性的** (这是电学模型里集中式lumped-model和分布式distributed-model的区别). 当传输线长度比较长时, 误差是无法忽略的. 而这里的计算参数和**配置**紧密相关.
+
+Q: OK那能介绍下配置吗?
+> A: 配置是根据传输线规格, 输电塔形制来的.
+![](./images/towers.png)
+如上图显示的是$750KV$电压规格下常见的输电塔规制. 重要的信息包括:
+- 三相电, 相与相之间的距离 (如最右侧的$30$英尺)
+- 相与地的距离 (如最右侧图的$90$英尺)
+> 我们首先给出了两侧节点的电压等级 (即上述标幺值标度下的$1$, 笔者的系统一般都是$375KV$), 然后从所有满足的输电塔配置中随机选择1个. 输电塔的这两个距离会影响相与相之前的电容, 电感; 输电塔两侧产生的电容.
+
+> 另一个配置是, 单相位一般对传输线采用**集束配置**以提高运力降低电阻, 您如果仔细看上图的话, 应该能看到每一相都有**4个点**, 一般地塔的电压规格越高, 倾向于使用更大的集束. 这方面简要的内容可以查看[slide, 11页的上下文](./slices/Section%204%20Transmission%20Lines.pdf).
+配置的最后一部分是传输线. 我们考虑ACSR (Aluminum Cable Steel Reinforced Conductors) 型传输线, 即钢结构保证机械强度, 铝结构保证导电性. 通过一些厂商给出的handbook可以知道详细的基本参数, 举例如下.
+![](./images/ACSR_1.png)
+使用这些原始数据, 结合**集束配置**, **输电塔配置**, **传输线总长**, 我们可以得到边的所有电气参数. 电气参数除了线路的**阻抗导纳**外, 还有**功率的承载能力** (如上图直接用电流强度衡量, 但实际中用的更多的是视在功率).
+
+Q: OK, 这部分电气参数有哪些具体计算的公式?
+> A: 以下公式省略复杂的推导过程 (其实很多能从textbook上获得, 计算相对简单).
+- 给定ACSR的元数据, 线总长, 交流电频率 (如我国为$50Hz$, 美国为$60Hz$), 塔楼的配置.
+```Golang
+// compute inductance effect of `t` tower configuration. return value in H per meter.
+// See P184, 192, 194 (especially the context of equation of (4.6.22)) of power system analysis and design.
+func (t *TowerConfig) ComputeInductance(tl *TransmissionLine) float64 {
+	// we consider 3 phases locate linearly and uniformly.
+	var GMD float64 = math.Pow(2*math.Pow(t.PhaseSpacing, 3), 1.0/3)
+	var DSL float64 = math.Pow(tl.GMR*math.Pow(BundleSpacing, float64(t.BundleCnt)), 1.0/(float64(t.BundleCnt+1)))
+
+	return 2 * 1e-7 * math.Log(GMD/DSL)
+}
+```
+$$D_{eq}=\sqrt[3]{D_{12}D_{23}D_{13}}$$
+$$D_{SL}=\sqrt[3]{D_{s}\times d^{2}}, \text{对三集束而言}$$
+$$L_{a}=2\times10^{-7}\ln{\frac{D_{eq}}{D_{SL}}} \text{H/m}$$
+> 其中$D_{s}$是ACSR的**等效半径** (近似为物理半径的$e^{-1/4}\approx0.78$倍, 这又是个复杂的电磁学计算), 由handbook给出. $d$是集束配置中中心点间距, 如下图.
+![](./images/bundle1.png)
+$D_{SL}$是相与相之间距离的几何平均, 如下图 (**所以说输电塔的配置需要某个距离**). 这里$L_{a}$就是计算出单位串联电感. 结合长度和角频率最后得出`x`参数.
+![](./images/phase1.png)
+
+```Golang
+// compute capacitance effect of `t` tower configuration. return value in F per meter.
+// See P208 (especially the context of equation of (4.10.4)) of power system analysis and design.
+func (t *TowerConfig) ComputeCapacitance(tl *TransmissionLine) float64 {
+	var GMD float64 = math.Pow(2*math.Pow(t.PhaseSpacing, 3), 1.0/3)
+	var DSC float64 = math.Pow(tl.Diameter/2*math.Pow(BundleSpacing, float64(t.BundleCnt)), 1.0/(float64(t.BundleCnt+1)))
+
+	return (2 * math.Pi * FreeSpacePermit) / math.Log(GMD/DSC)
+}
+
+// Resistance of serial impedance.
+// See P260 (the context of Π circuit) of power system analysis and design.
+// please notice that circuit only applies to short and medium length line.
+// for long transmission line, we have to solve differential function. Also see slice Section 4, P15~25, 36~51, 72~73.
+// dist in km. return in Ω.
+func (t *TowerConfig) ComputeTotalR(tl *TransmissionLine, dist float64) float64 {
+	return (tl.ResistanceDC * dist) / 1000
+}
+
+// Inductive Reactance of serial impedance. dist in km, freq in Hz.
+func (t *TowerConfig) ComputeTotalX(tl *TransmissionLine, dist float64, freq float64) float64 {
+	return 2 * math.Pi * freq * dist * 1000 * t.ComputeInductance(tl)
+}
+
+// Capacitive Reactance of shunt . dist in km, freq in Hz.
+// return in S.
+func (t *TowerConfig) ComputeTotalB(tl *TransmissionLine, dist float64, freq float64) float64 {
+	return 2 * math.Pi * freq * dist * 1000 * t.ComputeCapacitance(tl)
+}
+```
+> 另一方面, 传输线整体和大地 (大地被认为是电中性neutral的) 构成一个电容器. 这部分计算:
+$$
+C_{an}=\frac{2\pi\epsilon}{\ln{\left(D_{eq}/D_{SC}\right)}} \text{F/m}
+$$
+这里$\epsilon$是真空介电常数, 其余参数以上描述过且能用相同的方法计算得出.
+以上我们能得出传输线的串联阻抗和并联导纳, **当传输线路的长度可以忽略时这就足够了**. 但长度不能忽略时 (主要是交流电有**频率**, 就会有**相位**. 从一段传播到另一端是存在相位差的, **相位差和传输线长直接相关**). 我们根据已有的参数计算传播因子([wiki页面](https://en.wikipedia.org/wiki/Propagation_constant)), 这方面简要的内容可以查看[slide, 46页的上下文](./slices/Section%204%20Transmission%20Lines.pdf).
+$$Z'=Z\left(\frac{\sinh\left(\gamma l\right)}{\gamma l}\right)$$
+即串联阻抗$Z$需要一个关于距离的**非线性修正**, 其他参数同理.
+
+
+Q: OK. 以上这么多可以说是**生成**的步骤, 确实很麻烦. 那么**验证**又是什么? 又为什么要验证?
+
+> A: 因为哪怕我们生成的电网拓扑上很合适, 电气参数上也很合适, **它也不一定可行**. 我们衡量"可不可行", 是指每个要求被供电的节点, 它的需求能不能被满足, 同时每个节点的状态是不是稳定的 (简单来说电压的幅度要在一个比较窄的区间内, 才算稳定; 线路两端的相位差要足够小才算稳定.). 一种稳态的计算任务就是所谓的**潮流分析** ([参见wiki页面](https://en.wikipedia.org/wiki/Power-flow_study)). 潮流分析非常复杂, 一般使用基于迭代算法的开源软件求解 (因为实际上这个是高度非线性的优化问题). 我们生成的电网**未必能求解潮流分析**, 因此我们需要这个**验证**的步骤.
+现有的主流潮流分析软件, 如matpower是基于matlab的, 部署起来较为麻烦 (毕竟非常昂贵的商用软件). **且不同区域的电网存在比较明显的区别**, 于是笔者让电网的**生成和验证**解耦, server专职生成, client**准备自己的执行环境**, 以区域为单位验证.
+
+Q: 怎么解耦的? client怎么准备自己的执行环境?
+> A: 笔者使用消息队列 (kafka). 使用消息队列动机:
+- 这个系统中因为计算的复杂性, **生成**比**验证**慢太多了 (至少100倍的差距), 因此笔者希望有多个server作为生产者 (因为数据空间的巨大, 几乎不可能出现"撞车"的现象), 尽量能填满一个消费者.
+- 实际上电网存在一定的"区域性": 如美国德州是一个相对独立的电网单元 (即ERCOT, [参见](https://www.powermag.com/what-is-ercot-and-what-does-it-do/)), 因此电网天然有区域性. 让不同的client负责不同的地理区域 (典型的以state为单位), 可以进一步实现更高阶的目标 (**比如收敛失败, 如何在特定节点添加captor bank补偿电容器组以改善电压**, 这个非常困难而且不具备地理迁移性). 这里只需要让client订阅消息队列的特定topic, server发布到特定topic就可以了.
+
+> 执行环境clients各自将matpower打包成docker容器. 容器预置了所有的可执行文件; client自行编写脚本文件, 复制到容器内部, 组合调用容器内的可执行文件. client从消息队列中pull的数据也迁移到容器内脚本可知的, 约定的数据文件中.
+
+Q: 最终电网的数据结构是什么样的? 怎么存储的?
+> A: 为了验证的便利性 (即按照matpower适配的格式), 一张电网, 实际上可以认为是由 (**至少**) 三张表组成:
+表一是节点表, $n\times j$, 其中$j$是每个节点的属性数目. 属性包括上面所说的**经纬度**, **电压功率的电气参数**, **电压上下阈值**, **节点类型**等最重要的信息, 以及一系列诸如**所属地理区域**, **并联电导电纳**的参数. $j<20$.
+表二是传输线表, $m\times i$, 其中$i$是每个节点的属性数目. 属性包括**连接关系**, **串联复阻抗等电气参数**, **不同时间窗口能承载传输的功率阈值**, 以及一系列诸如**传输线两端相位差阈值**的参数. $i < 25$.
+表三是发电节点表, $t \times k$, 其中每个发电节点都首先是节点表中的节点, 但需要维护一些其余的信息. 诸如**有功/无功功率的最大/最小/当前值**, 而且存在一定的约束关系. 如下图见[matpower文档, 74页](./slices/MATPOWER-manual.pdf), 当发电节点有功功率取得$p_{max}$时, 无功功率无法取得理论上的极大值 (即不能取得这个矩形的右侧两个角), 一个简单化处理是如图规定出简化的可行域 (实际的可行域比这个复杂多了), **发电节点表需要维护这样的信息**.
+![](./images/PQ_curve.png)
+**因此本项目最终用一个json维护完整的电网**. 这个json存在3个key, 每个对应的value就是上述的表.
+
+> 也因为本项目用json存储, 因此数据没有持久化到数据库中. 同时, **对于电网单独修改少数字段, 无法期望有效果** (我们无法期望修改少数字段后, 一个原本通不过验证的电网现在通过验证了), 因此我们认为持久化到nosql数据库如mongodb也是不太有意义的. **最终直接存储在文件系统**.
+
+> client验证成功后会向主server进行post请求. 主要信息包括电网序列化后的sha256摘要. server处理post请求时, 会在mysql数据库中用sha256为主键查询对应的电网条目 (主要信息包括摘要码, 地理区域, 规模, 文件路径, 是否可计算) 元数据, 更新之.
+对于能计算的电网就能交付上游任务了.
