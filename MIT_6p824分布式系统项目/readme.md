@@ -43,5 +43,251 @@ Q: 实现raft算法遇到过什么坑吗?
  } 
  rf.mu.Unlock() 
 ``` 
-现在有什么问题? server#j倒计时结束后成为candidate, 开始term++, 广播RPC求票. 但是永远不可能成功: **因为它在minority的partition中**, 永远求不到足量的票, 也没成功当选的新leader去抑制它的RPC求票. 它一遍又一遍地倒计时到位后求票, 把term任期变量抬的很高, 下一次partition问题解决后, **成功选举出一个leader的term会变得非常大**, 出现**惊群现象**.
+现在有什么问题? server#j倒计时结束后成为candidate, 开始term++, 广播RPC求票. 但是永远不可能成功: **因为它在minority的partition中**, 永远求不到足量的票, 也没成功当选的新leader去抑制它的RPC求票. 它一遍又一遍地倒计时后求票, 把term任期变量抬的很高, 下一次partition问题解决后, **成功选举出一个leader的term会变得非常大**, 出现**惊群现象**.
 > 这个问题的根源还是没忠实地实现状态机: leader $\rightarrow$ follower的条件严格是遇到一个RPC交换时, term成员更大的server, **不应该在发现票不足数后, leader主动地退让**. 换句话说, **上帝视角下我们是允许整个集群同时存在多个leader的**, 但它们的term各不相同, 且仅term最大的那个合法, 这就够了.
+
+Q: 还遇到过哪些坑和状态机有关?
+> A: 还遇到一个坑. 我们该怎么理解"discover server with higher term"这个条件? 它可能发生在任意时刻, 一个笔者最开始忽视的时刻为 **`leader`在广播append RPC中途可能退化为`follower`**.
+```Golang
+for peer_id := range rf.peers {
+	// 考虑给自己以外的本集群内所有server发送RPC.
+	if peer_id == rf.me {
+		continue
+	}
+	wg.Add(1)
+	go func(id int) {
+		defer wg.Done()
+		exit_loop := false
+		// ...
+		/*
+		准备appendentry RPC的args.
+		RPC丢包的话超时重传.
+		*/
+		for !exit_loop {
+			reply := AppendEntriesReply{Success: false, Term: rf.current_term}
+			call_chan := make(chan bool, 1)
+			ok := false
+
+			go func(idd int) {
+				ok = rf.peers[idd].Call("Raft.AppendEntries", &args, &reply)
+				if ok {
+					call_chan <- true
+					return
+				}
+			}(id)
+			
+			// 设定30ms的timeout, go-routine fire同时启动.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+			select {
+			case <-ctx.Done():
+			// 倒计时打满分支
+			case <-call_chan:
+			// go-routine在倒计时之前写入了buffered channel
+			}
+			cancel()
+			/*
+			根据 ok变量和reply判断RPC通信成功与否, 请求是否如leader预期.
+			一种特殊情况是RPC通信成功了, 但对端endpoint因为term更大明确拒绝.
+			这个上下文是有互斥锁的, 但unlock的分支很多这里就省略了.
+			*/
+			if ok && !reply.Success {
+				if rf.current_term < reply.Term {
+					rf.current_term = reply.Term
+					rf.state = Follower
+					rf.persist()
+					// 如果exit_loop不更新为true表明RPC没能在timeout内被响应, 因此继续走`for !exit_loop`循环.
+					exit_loop = true
+					reply_success_chan <- reply.Success
+				}
+			}
+		} (peer_id)
+	}
+}
+```
+> 以上代码的问题在于: `rf.current_term = reply.Term`, `rf.state = Follower`, leader在接收到关于append entry RPC的明确拒绝时, **单单改变成员变量不调整控制流是错误的**. 一旦退化到follower后要立即停止append entry RPC的广播, 因此这个`if` 分支需要完整地退出`for peer_id := range rf.peers`整个循环! 如果不这么做, 对于`for peer_id := range rf.peers`中后启动的go-routine, 它们认为**实际上是过期的leader**, term非常新, 于是这些follower在一定情况下会删除自己的日志条目 (具体参见论文AppendEntries RPC impeachmentation的第3点.).
+
+Q: 你上面这个`ok` bool变量有没有问题? 在go-routine A定义并多出使用, A又启动了一个新的go-routine B, B会修改`ok` (因为作为RPC通信成功与否的的返回值), 有没有数据竞争?
+
+> A: 的确上面这个代码在解决**错误的状态机转换**问题后, 的确还存在数据竞争问题.
+```
+WARNING: DATA RACE
+Write at 0x00c00016419f by goroutine 107:
+  6.5840/raft.(*Raft).sendAppendEntries_broadcast.func1.1()
+      /home/yhqian/archives/LABS/MIT_6p5840/src/raft/raft.go:569 +0x11c
+  6.5840/raft.(*Raft).sendAppendEntries_broadcast.func1.3()
+      /home/yhqian/archives/LABS/MIT_6p5840/src/raft/raft.go:576 +0x41
+
+Previous read at 0x00c00016419f by goroutine 104:
+  6.5840/raft.(*Raft).sendAppendEntries_broadcast.func1()
+      /home/yhqian/archives/LABS/MIT_6p5840/src/raft/raft.go:592 +0xa52
+  6.5840/raft.(*Raft).sendAppendEntries_broadcast.func2()
+      /home/yhqian/archives/LABS/MIT_6p5840/src/raft/raft.go:634 +0x41
+```
+> 具体来说以下时间线的事情是完全可能发生的:
+- go-routine A定义变量ok `ok := false`; 开启go-routine B, B可能赋ok为true.
+- A启动了一个30ms的上下文持续阻塞在这里, 然后上下文到期了, A顺序执行.
+- A因为上下文到期了判定丢包, 分支里做一些简单但不是原子的处理; **与此同时** (即进入了判定分支, 正在处理逻辑), go-routine B有了结果, 改了**ok**.
+> 这里问题的核心是, 无法对RPC的时延做出一个很好的估计 (总会有离群值超出设定的上下文时长), 然后面对离群值时出现先读后写竞争.
+解决方式很简单: go-routine A在启动go-routine B后不再直接使用`ok`变量. 和`ok`同时定义`tmp_ok`变量, 它只能在严格的倒计时上下文被修改. 后面的分支判断全用`tmo_ok`.
+```Golang
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+select {
+case <-ctx.Done():
+case <-call_chan:
+	tmp_ok = true
+}
+cancel()
+```
+
+Q: raft实现中你遇到最大的困难是什么?
+> A: 一个非常隐蔽的问题 (**和go-routine的调度有关**), 直到做到lab#4才找到这个问题. 考虑到给raft增加快照之后. 实质是raft需要按顺序地**commit**和**apply**, **commit**因为raft在算法上已经给我们保证了但是应用是对raft透明的, **怎么保证apply的顺序性**?
+如果一个follower server (我们叫server#x) 很久之前崩溃了, 它现在启动且落后其他server很多了. 因为只有这一台机器崩溃了, 其他的servers依然构成majority能commit相当多的日志. 现在的问题是: 怎么让server#x快速赶上其余的server? 依然是基于appendentry, server#x自己commit, 最终逐个apply给应用层吗?
+一个更好的方法是让server#x从leader处**直接安装快照**, 让它一次性在视图上与至少majority的server一致.
+如下图, 在term#0, server#0持续为leader, 而server#4初期短暂在线后持续下线, 最终上线.
+![](./imgs/snapshot.png)
+站在server#0的视角下, 蓝色的条目都被自己commit了所以能打包成快照, 维护快照的`Last_included_index/Last_included_term`, 即`[0...Last_included_index+1]`的完整slice之前作为log的slice, 现在整体作为snapshot.
+server#0因为维护所有follower的nextIndex和matchIndex数组因此能注意到某些滞后的server (**比较数组中该server的项与Last_included_index即可**), 遇到这样的server, leader发送snapshot (目前的实现, 快照是全量的这是个不小的缺憾), 通过RPC.
+- 之后的follower接受到快照后更新一些信息 (因为每个server都有快照, 只是leader能发送, 其他的只能被动接收) 后RPC返回. **有一些耗时的操作笔者用go-routine异步进行** (最主要的是apply到应用层)
+- leader的snapshot RPC成功后, 更新对应follower的数组项 (不然**日志的追加** append entry RPC无法进行).
+```Golang
+func (rf *Raft) prepare_and_send_snapshot(server int) bool {
+	rf.mu.Lock()
+	// 忠实履行原论文. 唯独简化分块传输.
+	args := InstallSnapshotArgs{
+		Term:                rf.current_term,
+		Leader_id:           rf.me,
+		Last_included_index: rf.last_include_index,
+		Last_included_term:  rf.last_include_term,
+		Data:                rf.snapshot}
+	reply := InstallSnapshotReply{}
+	rf.mu.Unlock()
+
+	ok := rf.sendInstallSnapshot(server, &args, &reply)
+	if !ok {
+		return false
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if reply.Term > rf.current_term {
+		rf.state = Follower
+		rf.vote_for = -1
+		rf.current_term = reply.Term
+		rf.persist()
+		return false
+	}
+	if rf.current_term != args.Term {
+		return false
+	}
+	/*
+	快照对应的日志下标为[0, rf.last_include_index],
+	因此下一个插入理论为rf.last_include_index+1.
+	*/
+	rf.next_index[server] = max(rf.next_index[server], rf.last_include_index+1)
+	rf.match_index[server] = rf.next_index[server] - 1
+	return true
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+```
+- leader将snapshot以外的entry以append entry RPC发给这个server, 如上图的`1|b<-2`.
+在leader的视角下, `prepare_and_send_snapshot`和`sendAppendEntries`两个RPC严格先后执行: 第一个结束了第二个才执行. **但是**follower响应RPC时, 都需要apply, 而apply是异步执行的.
+```Golang
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.current_term
+	if rf.current_term > args.Term {
+		return
+	}
+	if rf.current_term < args.Term {
+		rf.state = Follower
+		rf.current_term = args.Term
+		rf.vote_for = -1
+		rf.leader_id = -1
+	}
+	rf.reset_election_timer()
+	if rf.commit_index > args.Last_included_index || rf.last_include_index >= args.Last_included_index {
+		return
+	}
+	// 一些follower安装snapshot的逻辑.
+	rf.log = []LogEntry{{Term: args.Last_included_term, Data: nil}}
+	
+	rf.last_include_index = args.Last_included_index
+	rf.last_include_term = args.Last_included_term
+	rf.commit_index = args.Last_included_index
+	rf.snapshot = args.Data
+
+	rf.last_applied = args.Last_included_index
+	Messages := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotIndex: args.Last_included_index,
+		SnapshotTerm:  args.Last_included_term}
+	// go-routine异步交付到应用层.
+	go func() {
+		rf.apply_lock.Lock()
+		rf.applyCh <- Messages
+		rf.apply_lock.Unlock()
+	}()
+
+	rf.persist()
+}
+```
+- 早期实现版本中, `applyLogs`只会在特定时刻触发. **follower顺序响应prepare_and_send_snapshot和sendAppendEntries时**, 分别先后开启go-routine. **但是我们不能保证先开启的go-routine会先执行** (一切的问题都源于这个想当然的假定)!!!!
+```Golang
+// apply the committed logs.
+func (rf *Raft) applyLogs() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for i := rf.last_applied + 1; i <= rf.commit_index; i++ {
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[i].Data,
+			CommandIndex: i,
+		}
+		DPrintf("commit cmd by server %v. index/data: %v/%v", rf.me, i, rf.log[i].Data)
+		rf.last_applied = i
+	}
+}
+// example AppendEntries RPC handler.
+//
+// if `args.Entries` is empty, it is a heartbeat call.
+// `index` starts from 1, and should subscripts `rf.log` with [0].
+// follower apply的逻辑.
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	/// ...
+	// Receiver implementation (5)
+	if args.Leader_commit > rf.commit_index {
+		rf.commit_index = min(args.Leader_commit, len(rf.log))
+		go rf.applyLogs()
+	}
+	/// ...
+}
+// leader apply的逻辑.
+func (rf *Raft) sendAppendEntries() {
+	for log_index := rf.get_nxt_log_index() - 1; log_index > rf.commit_index; log_index-- {
+		cnt := 1
+		if rf.log[log_index].Term == rf.current_term {
+			for peer_id := range rf.peers {
+				if peer_id != rf.me && rf.match_index[peer_id] >= log_index {
+					cnt++
+				}
+			}
+			if 2*cnt > len(rf.peers) {
+				rf.commit_index = log_index
+				DPrintf("server %v as leader, updates commit index to %v", rf.me, rf.commit_index)
+				go rf.applyLogs()
+				break
+			}
+		}
+	}
+}
+```
+![](./imgs/snapshot.png)
+我们再看这个图. b的最新值是`2`. 因此对于后开始的, 对应append `1|b<-2`这个log entry的go-routine我们严格要求它后执行: 如果先执行它, 再执行对应的snapshot的话, `b:2`会被snapshot覆盖!
