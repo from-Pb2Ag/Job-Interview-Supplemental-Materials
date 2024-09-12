@@ -128,7 +128,7 @@ Previous read at 0x00c00016419f by goroutine 104:
 - A启动了一个30ms的上下文持续阻塞在这里, 然后上下文到期了, A顺序执行.
 - A因为上下文到期了判定丢包, 分支里做一些简单但不是原子的处理; **与此同时** (即进入了判定分支, 正在处理逻辑), go-routine B有了结果, 改了**ok**.
 > 这里问题的核心是, 无法对RPC的时延做出一个很好的估计 (总会有离群值超出设定的上下文时长), 然后面对离群值时出现先读后写竞争.
-解决方式很简单: go-routine A在启动go-routine B后不再直接使用`ok`变量. 和`ok`同时定义`tmp_ok`变量, 它只能在严格的倒计时上下文被修改. 后面的分支判断全用`tmo_ok`.
+解决方式很简单: go-routine A在启动go-routine B后不再直接使用`ok`变量. 和`ok`同时定义`tmp_ok`变量, **它只在严格的倒计时上下文被修改**. 后面的分支判断全用`tmo_ok`.
 ```Golang
 ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 select {
@@ -143,7 +143,8 @@ Q: raft实现中你遇到最大的困难是什么?
 > A: 这个问题有一定的背景. 参见课程的蓝图[架构Api](http://nil.csail.mit.edu/6.5840/2023/notes/raft_diagram.pdf).
 ![](./imgs/arch.png)
 简单描述下这个非常隐蔽的问题 (**和go-routine的调度有关**): 当我们引入红色的快照系统后, 怎么处理新的`applyCh()`事件和旧的(关于append log)的`applyCh()`事件?
-**这里事实上存在一个同步关系, 需要我们自行保证**.
+和实现有关: **如果这两个事件用同一个不会并发的函数实现, 通过不同传参触发那比较好弄**; 
+但我的实现存在并发问题, 于是: **这里事实上存在一个同步关系, 需要我们自行保证**.
 
 > 直到做到lab#4才找到这个问题. 考虑到给raft增加快照之后. 实质是raft需要按顺序地**commit**和**apply**, **commit**因为raft在算法上已经给我们保证了但是应用是对raft透明的, **怎么保证apply的顺序性**?
 如果一个follower server (我们叫server#x) 很久之前崩溃了, 它现在启动且落后其他server很多了. 因为只有这一台机器崩溃了, 其他的servers依然构成majority能commit相当多的日志. 现在的问题是: 怎么让server#x快速赶上其余的server? 依然是基于appendentry, server#x自己commit, 最终逐个apply给应用层吗?
@@ -355,3 +356,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 ```
+
+> 在日志debug后, 笔者更进一步地查看了golang的文档 (主要和[内存模型有关](https://go.dev/ref/mem), 同时也深化了C++11关于memory order的一些知识), 与这个bug直接有关的内容如下 (均摘录于上面的链接):
+
+>  The go statement that starts a new goroutine is synchronized before the start of the goroutine's execution.
+
+> The exit of a goroutine is not guaranteed to be synchronized before any event in the program. For example, in this program:
+
+> If the effects of a goroutine must be observed by another goroutine, use a synchronization mechanism such as a lock or channel communication to establish a relative ordering.  
