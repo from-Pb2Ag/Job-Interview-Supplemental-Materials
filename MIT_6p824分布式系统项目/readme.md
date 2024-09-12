@@ -1,7 +1,7 @@
 # MIT 6p824分布式系统项目
 **为什么做**:
 - 多年前就声名远播, 笔者认为现在稍微有空能做一下了.
-- 熟练掌握一门副语言 (Golang. 主语言当然还是C/C++).
+- **熟练掌握一门副语言** (Golang. 主语言当然还是C/C++).
 - 入门一个重要, 难, 经常耳闻但个人知识不成体系的领域.
 
 
@@ -16,7 +16,7 @@
 Q: 为什么要用raft? raft有什么缺点嘛? 对数据一致性的要求就非得这么高嘛, 相对更简单的Redis主从结构甚至集群结构不行嘛?
 > A: 根本原因是这个大lab有4部分, 其中lab#2要求忠实地实现raft共识算法 (悲). raft的确存在一些可能的缺陷:
 - leader节点的负担太重了: 像zookeeper内部共识用的zab原子广播, 让leader节点负责写和同步, **众多的follower节点可以各自负责处理client的读请求**. 它随着集群的扩展是能提高吞吐量的. 但raft里对读请求依然需要leader广播, 达成majority日志持久化. 因此随着集群内部replica数目增加, **的确可靠性增加了, 但leader的RPC开销显著增加**, 吞吐量是减小的.
-- **raft不像paxos支持"乱序commit"**. raft的log commit机制有一些性质, 基于下标 (index) 和日志对应任期 (term) 进行选举, follower日志的commit. 因此如果index为 $[i]$ 的日志条目没有被append, index为$[i+1]$的条目也无法被append, 更不能被commit. 这在网络质量比较差, 且`appendentry` RPC比较频繁且每个这样的RPC携带日志条目不多的情况下是可能发生的. 表现上非常像TCP的"Head-of-Line blocking"队头阻塞. TCP发生这种问题的根源是它字节确认且传输存在MTU; raft存在这种问题的根源是**协议要求的日志性质**.
+- **raft不像paxos支持"乱序commit"**. raft的log commit机制有一些性质, 基于下标 (index) 和日志对应任期 (term) 进行选举, follower日志的commit. 因此如果index为 $[i]$ 的日志条目没有被append, index为$[i+1]$的条目也无法被append, 更不能被commit. 这在网络质量比较差, 且`appendentry` RPC比较频繁, 每个这样的RPC携带日志条目不多的情况下是可能发生的. 表现上非常像TCP的"Head-of-Line blocking"队头阻塞. TCP发生这种问题的根源是它字节确认且传输存在MTU/MSS; raft存在这种问题的根源是**协议要求的日志性质** (成也萧何败也萧何?).
 
 Q: 实现raft算法遇到过什么坑吗?
 
@@ -140,7 +140,12 @@ cancel()
 ```
 
 Q: raft实现中你遇到最大的困难是什么?
-> A: 一个非常隐蔽的问题 (**和go-routine的调度有关**), 直到做到lab#4才找到这个问题. 考虑到给raft增加快照之后. 实质是raft需要按顺序地**commit**和**apply**, **commit**因为raft在算法上已经给我们保证了但是应用是对raft透明的, **怎么保证apply的顺序性**?
+> A: 这个问题有一定的背景. 参见课程的蓝图[架构Api](http://nil.csail.mit.edu/6.5840/2023/notes/raft_diagram.pdf).
+![](./imgs/arch.png)
+简单描述下这个非常隐蔽的问题 (**和go-routine的调度有关**): 当我们引入红色的快照系统后, 怎么处理新的`applyCh()`事件和旧的(关于append log)的`applyCh()`事件?
+**这里事实上存在一个同步关系, 需要我们自行保证**.
+
+> 直到做到lab#4才找到这个问题. 考虑到给raft增加快照之后. 实质是raft需要按顺序地**commit**和**apply**, **commit**因为raft在算法上已经给我们保证了但是应用是对raft透明的, **怎么保证apply的顺序性**?
 如果一个follower server (我们叫server#x) 很久之前崩溃了, 它现在启动且落后其他server很多了. 因为只有这一台机器崩溃了, 其他的servers依然构成majority能commit相当多的日志. 现在的问题是: 怎么让server#x快速赶上其余的server? 依然是基于appendentry, server#x自己commit, 最终逐个apply给应用层吗?
 一个更好的方法是让server#x从leader处**直接安装快照**, 让它一次性在视图上与至少majority的server一致.
 如下图, 在term#0, server#0持续为leader, 而server#4初期短暂在线后持续下线, 最终上线.
@@ -229,8 +234,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotIndex: args.Last_included_index,
 		SnapshotTerm:  args.Last_included_term}
 	// go-routine异步交付到应用层.
+	rf.apply_lock.Lock()
 	go func() {
-		rf.apply_lock.Lock()
+		// rf.apply_lock.Lock()
 		rf.applyCh <- Messages
 		rf.apply_lock.Unlock()
 	}()
@@ -290,4 +296,62 @@ func (rf *Raft) sendAppendEntries() {
 }
 ```
 ![](./imgs/snapshot.png)
-我们再看这个图. b的最新值是`2`. 因此对于后开始的, 对应append `1|b<-2`这个log entry的go-routine我们严格要求它后执行: 如果先执行它, 再执行对应的snapshot的话, `b:2`会被snapshot覆盖!
+我们再看这个图. b的最新值是`2`. 因此对于后开始的, 对应append `1|b<-2`这个log entry的go-routine我们严格要求它后执行: 如果先执行它, 再执行对应的snapshot的话, `b:2`会被snapshot覆盖 (**这个问题是疯狂打印高精度日志才发现的**)!
+
+如何解决这个问题? 这里笔者注意到一点: **如果出现这种"snapshot"和"append log"并发的情况, 我们严格地需要"snapshot"先响应完成再响应"append log"**. 分析出后笔者使用**条件变量+专用互斥锁**解决这个问题 (因为也只需要同步这两个, 不需要考虑扩展性).
+使用`rf.apply_lock`这把专门的互斥锁处理apply. 这样只需要保证`InstallSnapshot()`内的go-routine率先获得这个锁就行了. `InstallSnapshot()`进入就获取全局锁, 修改`rf.last_applied`, `rf.commit_index`, 同时`applyLogs()`因为条件变量wait. 等到被唤醒时 (这就保证了后发生), 会等待`rf.apply_lock`专门锁的释放.
+```Golang
+// apply the committed logs. only use a single go-routine.
+// protect with mutex when `append` into buffer. when the `append` into buffer operation
+// is ended, release the lock so it can do other operations (response to other RPCs.)
+func (rf *Raft) applyLogs() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for !rf.killed() {
+		Messages := make([]ApplyMsg, 0)
+		// 在接收leader的snapshot后 (启动它的go-routine前), rf.last_applied, rf.commit_index会更新到一样大. 于是cv进入wait.
+		if rf.last_applied < rf.commit_index {
+			for i := rf.last_applied + 1; i <= rf.commit_index && i <= rf.last_log_index(); i++ {
+				Messages = append(Messages, ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[i-rf.last_include_index].Data,
+					CommandIndex: i,
+
+					SnapshotValid: false,
+				})
+				rf.last_applied = i
+			}
+			rf.mu.Unlock()
+
+			rf.apply_lock.Lock()
+			for _, msg := range Messages {
+				rf.applyCh <- msg
+			}
+			rf.apply_lock.Unlock()
+
+			rf.mu.Lock()
+		} else {
+			rf.apply_cond.Wait()
+		}
+	}
+}
+
+// example AppendEntries RPC handler.
+//
+// if `args.Entries` is empty, it is a heartbeat call.
+// `index` starts from 1, and should subscripts `rf.log` with [0].
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	/// ...一系列复杂逻辑, 包括对log的追加, 最后unlock.
+	if args.Leader_commit > cur_commit_index {
+		rf.mu.Lock()
+		rf.commit_index = min(args.Leader_commit, last_log_index_2)
+		if rf.last_applied < rf.commit_index {
+			rf.apply_cond.Signal()
+		}
+		rf.mu.Unlock()
+		// go rf.applyLogs()
+	}
+
+	reply.Success = true
+}
+```
