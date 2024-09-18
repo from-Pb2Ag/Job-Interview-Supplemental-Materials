@@ -363,4 +363,172 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 > The exit of a goroutine is not guaranteed to be synchronized before any event in the program. For example, in this program:
 
-> If the effects of a goroutine must be observed by another goroutine, use a synchronization mechanism such as a lock or channel communication to establish a relative ordering.  
+> If the effects of a goroutine must be observed by another goroutine, use a synchronization mechanism such as a lock or channel communication to establish a relative ordering.
+
+Q: lab#3的KV数据库做了什么? 架构大概是什么样的?
+> A: 架构如之前描述的图所示:
+![](./imgs/arch.png)
+在底层的raft基础上搭建应用层的replica state machine. `clerk machine`向外暴露三个接口 (以下摘自[课程指南](https://pdos.csail.mit.edu/6.824/labs/lab-kvraft.html)): 
+
+>  Clients will interact with your key/value service in much the same way as Lab 2. In particular, clients can send three different RPCs to the key/value service:
+- `Put(key, value)`: replaces the value for a particular key in the database
+- `Append(key, arg)`: appends arg to key's value (treating the existing value as an empty string if the key is non-existent)
+- `Get(key)`: fetches the current value of the key (returning the empty string for non-existent keys)
+> Keys and values are strings. Note that unlike in Lab 2, neither Put nor Append should return a value to the client. Each client talks to the service through a Clerk with Put/Append/Get methods. The Clerk manages RPC interactions with the servers.
+
+以`Put(key, value)`方法为例, 具体发生一系列事情:
+- `clark machine`调用`Put(key, value)`方法, 每个clark记录所有replica state machine于`servers`, 同时记录对应的leader下标于`leader_id` (raft层对应leader的上游就是RSM中的leader, **可能是stale的**). 向`servers[leader_id]`发RPC (即最顶上的$\textcolor{blue}{blue}$边).
+	```Golang
+	type Clerk struct {
+		servers []*labrpc.ClientEnd
+		// You will have to modify this struct.
+		leader_id int64
+		me        int64		// 考虑有多个clerk实例.
+		seq       int64
+	}
+	```
+- 被RPC调用的RSM要"刺探"下层的raft实例, 通过图中所示的`start()`方法. 刺探的目的为: 
+	- 验证对应的下层raft实例的确为leader这样才能写入. 否则RPC返回失败, clerk更新`leader_id`找另一个RSM发起RPC.
+	- 如果的确是leader, 需要把RPC参数解析后在raft层达成共识. **raft层向上apply时才返回RPC的reply**.
+
+- 为抑制"time-travel"问题, 每个RSM维护`kv.client_cache_table`哈希表, **表示对每个`clark`成功响应的最大任务号**. 这要求clerk在收到RPC成功的回应后, 执行成员的`seq++`操作. 如果RSM收到了过时的RPC请求 (**之前明确成功回复过**), 提前终止 (考虑下面的第一个`return`).
+	```Golang
+	type Op struct {
+		// 命令日志化的结构.
+		// Your definitions here.
+		// Field names must start with capital letters,
+		// otherwise RPC will break.
+		Is_get       bool
+		Is_putAppend bool
+		Client_id    int64
+		Seq          int64
+		Key          string
+		Value        string
+		Put_orAppend string
+	}
+
+	func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+		// Your code here.
+		kv.mu.Lock()
+		if args.Seq_num <= kv.client_cache_table[args.Client_id] {
+			reply.Err = OK
+			kv.mu.Unlock()
+			return
+		}
+		cmd := Op{Put_orAppend: args.Op, Is_putAppend: true, Seq: args.Seq_num,
+			Client_id: args.Client_id, Key: args.Key, Value: args.Value}
+		_, _, is_leader := kv.rf.Start(cmd)
+		if !is_leader {
+			reply.Err = ErrWrongLeader
+			kv.mu.Unlock()
+			return
+		}
+
+		ch := make(chan Op, 1)
+		kv.wait_Ch[args.Client_id] = ch
+		kv.mu.Unlock()
+		// 这里注意下面execute()函数的`if op.Is_get`分支.
+		select {
+		case op := <-ch:
+			kv.mu.Lock()
+			delete(kv.wait_Ch, op.Client_id)
+			kv.mu.Unlock()
+			if cmp_command(cmd, op) {
+				reply.Err = OK
+				DPrintf("kv server %v: ret <%v, %v> (p/a) kv: <%v, %v>",
+					kv.me, op.Client_id, op.Seq, op.Key, op.Value)
+				return
+			} else {
+				reply.Err = ErrWrong
+				return
+			}
+		case <-time.After(time.Duration(500) * time.Millisecond):
+			kv.mu.Lock()
+			delete(kv.wait_Ch, args.Client_id)
+			kv.mu.Unlock()
+			reply.Err = TimeOut
+			return
+		}
+	}
+	```
+
+- 在底层的raft commit后并通过channel向上层apply后, `ch`被写入 (注意到这里的`start()`有互斥锁保护, 因此`apply`顺序是严格的, 必定交付到对应的client id!). `cmp_command(cmd, op)`为真表明RPC的args (即我们通过`start()`写入的), 和向上`apply()`的 (即通过channel传递的`op`) **一致** (比较`op struct`的`Client_id`和`Seq`两个字段就能做到).
+
+- raft层向上apply通用RSM的long-run go-routine `execute()`实现. 只有RSM中的leader向clark提供服务, **其他的RSM也要运行`execute()`保持较新的状态**. 处理自行制造日志, 安装来自leader的日志.
+	```Golang
+	// RSM部分启动代码如下. `kv.applyCh`约定了apply的方式.
+	// You may need initialization code here.
+
+	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	// You may need initialization code here.
+	kv.kv_table = make(map[string]string, 0)
+	kv.client_cache_table = make(map[int64]int64, 0)
+	kv.wait_Ch = make(map[int64]chan Op, 0)
+	kv.bytes_cnt = 0
+	kv.persister = persister
+	kv.readSnapshot(kv.persister.ReadSnapshot())
+
+	go kv.execute()
+	```
+	```Golang
+	func (kv *KVServer) execute() {
+		// long-run.
+		for !kv.killed() {
+			msg := <-kv.applyCh
+			if msg.CommandValid {
+				kv.mu.Lock()
+				op := msg.Command.(Op)
+				kv.bytes_cnt += int(unsafe.Sizeof(Op{})) + len(op.Key) + len(op.Key) + len(op.Value) + 8
+				kv.mu.Unlock()
+				if op.Is_get {
+					kv.mu.Lock()
+					client_id := op.Client_id
+					kv.client_cache_table[client_id] = max(kv.client_cache_table[client_id], op.Seq)
+					_, ok := kv.wait_Ch[client_id]
+					// 注意`kv.wait_Ch[client_id]`写入和Clerk->RSM RPC方法的联动.
+					if ok && kv.client_cache_table[client_id] == op.Seq {
+						op.Value = kv.kv_table[op.Key]
+						select {
+						case kv.wait_Ch[client_id] <- op:
+						default:
+						}
+					}
+					kv.mu.Unlock()
+				} else {
+					// `put`, `append`逻辑.
+				}
+				// log太大了, 后台做snapshot.
+				if kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate && kv.bytes_cnt > kv.maxraftstate {
+					snapshot := kv.getSnapshot()
+					kv.bytes_cnt = 0
+					go func(i int) {
+						kv.rf.Snapshot(i, snapshot)
+					}(msg.CommandIndex)
+					continue
+				}
+			} else {
+				// invalid的log就是snapshot, 安装来自leader的snapshot.
+				kv.mu.Lock()
+				snapshot := msg.Snapshot
+				kv.readSnapshot(snapshot)
+				kv.mu.Unlock()
+			}
+		}
+	}
+	```
+
+Q: 在应用层有什么东西需要特别考虑的嘛? 因为它们可能对raft层是透明的.
+> A: 一个重要的考量是, snapshot我们究竟需要维护哪些信息?
+为了应对"time-travel"和re-order的问题, 笔者让clerk维护单调递增的请求序列号`seq`, 序列化入RPC的请求参数, 且在RPC成功后自增.
+笔者认为snapshot维护两个哈希表就够了:
+```Golang
+/*
+数据库本身应当达成一致.
+clerk-specific的序列号也该达成一致. 而且clark其实不关心具体和哪个RSM通信.
+*/
+kv_table  map[string]string
+client_cache_table map[int64]int64
+```
+> 引入了`client_cache_table`, 但它的**更新时机**需要认真考虑. 假设一段时间内网络质量很好, 都是RSM的leader, RSM#x在和某个确定的clark通信. 因此RSM#x的`client_cache_table`更新是很直观的. 但如果RSM#x crash了, 可不可能选出一个新的raft leader, 它对应的RSM的`client_cache_table`非常旧呢? **因此`client_cache_table`的更新时机是apply阶段**, 从`Op`结构体解析更新. 同时对一个新当先的raft leader, 在`apply`赶上`commit index`之前不能append新的日志 (即RSM不能调用`start()`, 还是因为clark的序列号问题.)
