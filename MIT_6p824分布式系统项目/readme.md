@@ -942,4 +942,10 @@ Q: $\textcolor{blue}{UpdateShard()}$这个RPC的reply是干嘛的? 有reply了�
 这里的核心问题是:
 - group#0刚开始是由其中的server#2作为leader发起$\textcolor{blue}{UpdateShard()}$迁移广播的, **因此reply也只能找到group#0server#2**. reply的意义是遏制这个server再广播重复的RPC (**注意发送是个死循环, 循环跳出条件就是成功的reply**.)
 - 但是reply到达group#0server#2时, **server#2可能就不再是group#0的leader**. 如果group#0server#1的日志和它的一样新 (commit意义上), 哪怕它apply地没那么快, **group#0server#1完全可能是新的leader**, **但这个leader可能在应用层的状态依然是滞后的** (因为还没充分apply, 一旦apply完就是最新的).
-- 因此只依靠$\textcolor{blue}{UpdateShard()}$RPC的回应, **不能保证让group#0的quorum都确认这个移交被对面commit了**. 而要做到这一步, 需要group#0就"移交事件已被对面commit"这一点达成共识. 因此这里设计了$\textcolor{orange}{UpdateShardDone()}$这个, 在$\textcolor{blue}{UpdateShard()}$中异步执行的RPC. sending gp执行$\textcolor{orange}{UpdateShardDone()}$时, 每个RSM会等待apply. apply后表示本config中`->group#2`的移交不需要再发起新的; 而依然在进行中的`->group#2`的移交会等待$\textcolor{blue}{UpdateShard()}$RPC的reply跳出循环.
+- 因此只依靠$\textcolor{blue}{UpdateShard()}$RPC的回应, **不能保证让group#0的quorum都确认这个移交被对面commit了**. 而要做到这一步, 需要group#0就"移交事件已被对面commit"这一点达成共识. 因此这里设计了$\textcolor{orange}{UpdateShardDone()}$这个, 在$\textcolor{blue}{UpdateShard()}$中异步执行的RPC. sending gp执行$\textcolor{orange}{UpdateShardDone()}$时, 每个RSM会等待apply. apply后表示本config中`->group#2`的移交不需要再发起新的 (**即朝本轮完成的目标更近了一步**); 而依然在进行中的`->group#2`的移交会等待$\textcolor{blue}{UpdateShard()}$RPC的reply跳出循环.
+
+Q: 这个系统离现实部署还有哪些差距?
+> A: 笔者实现了基础的分块传输RPC数据 (对于group内部的快照, group之前的巨大shard)
+- 目前的快照是**全量式**而不是增量式的.
+- lab要求实现一个**线性一致性**的系统, 这样的方案开销较大.
+- sharing movement阶段会Stop of The World. 即此刻**无法向外对clark提供服务** (一个challenge额外问题是这个, 但笔者没选择解决它).
